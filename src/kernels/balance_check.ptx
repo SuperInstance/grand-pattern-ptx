@@ -1,0 +1,58 @@
+//
+// balance_check.ptx — Double-entry balance check kernel
+// Grand Pattern Fibonacci Dual-Direction Architecture
+//
+// Each thread handles one room.
+// result[i] = (z_in_count[i] == z_out_count[i]) ? 0 : 1
+// Global atomic counter tracks total imbalances.
+//
+
+.version 8.0
+.target sm_70
+.address_size 64
+
+.visible .entry balance_check(
+    .param .u64 z_in_counts_ptr,
+    .param .u64 z_out_counts_ptr,
+    .param .u64 result_ptr,
+    .param .u64 imbalance_count_ptr,
+    .param .u32 n
+)
+{
+    .reg .u32   tid, n_val, z_in, z_out, one;
+    .reg .u64   addr_in, addr_out, addr_result, addr_imbalance;
+    .reg .pred  p_valid, p_imbalance;
+
+    ld.param.u64  addr_in, [z_in_counts_ptr];
+    ld.param.u64  addr_out, [z_out_counts_ptr];
+    ld.param.u64  addr_result, [result_ptr];
+    ld.param.u64  addr_imbalance, [imbalance_count_ptr];
+    ld.param.u32  n_val, [n];
+
+    cvta.to.global.u64 addr_in, addr_in;
+    cvta.to.global.u64 addr_out, addr_out;
+    cvta.to.global.u64 addr_result, addr_result;
+    cvta.to.global.u64 addr_imbalance, addr_imbalance;
+
+    mov.u32  tid, %tid.x;
+
+    setp.ge.u32  p_valid, tid, n_val;
+    @p_valid bra  EXIT;
+
+    ld.global.u32  z_in,  [addr_in + tid*4];
+    ld.global.u32  z_out, [addr_out + tid*4];
+
+    setp.ne.u32  p_imbalance, z_in, z_out;
+
+    mov.u32  one, 1;
+
+    // result[i] = imbalanced ? 1 : 0
+    selp.u32  z_in, one, 0, p_imbalance;
+    st.global.u32  [addr_result + tid*4], z_in;
+
+    // Atomically increment global imbalance counter
+    @p_imbalance atom.global.add.u32  z_out, [addr_imbalance], one;
+
+EXIT:
+    ret;
+}

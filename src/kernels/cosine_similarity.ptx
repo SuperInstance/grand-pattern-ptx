@@ -1,0 +1,154 @@
+//
+// cosine_similarity.ptx — Parallel cosine similarity kernel
+// Grand Pattern Fibonacci Dual-Direction Architecture
+//
+// Computes cosine similarity between two embedding arrays.
+// Grid: n blocks, block: ceil(dim/32) warps
+// Each block computes one pair's cosine similarity.
+//
+
+.version 8.0
+.target sm_70
+.address_size 64
+
+//
+// dot_norm_kernel — compute dot product, norm_a^2, norm_b^2 per block
+// Inputs:
+//   a[]      — first embedding array (n * dim floats)
+//   b[]      — second embedding array (n * dim floats)
+//   out[]    — output: n floats (cosine similarities)
+//   n        — number of pairs
+//   dim      — embedding dimension
+//
+// Shared memory layout: [dot_sum, norm_a_sum, norm_b_sum] — 3 floats per block
+//
+
+.visible .entry cosine_similarity(
+    .param .u64 a_ptr,
+    .param .u64 b_ptr,
+    .param .u64 out_ptr,
+    .param .u32 n,
+    .param .u32 dim
+)
+{
+    .reg .f32   fval, fsum, fnorm_a, fnorm_b, ftmp;
+    .reg .f64   dsum, dnorm_a, dnorm_b, dtmp;
+    .reg .u64   addr_a, addr_b, addr_out;
+    .reg .u32   tid, block_id, stride, idx, dim_val, n_val;
+    .reg .u32   lane_id, warp_id, lane_mask;
+    .reg .pred  p_valid;
+
+    // Load params
+    ld.param.u64  addr_a, [a_ptr];
+    ld.param.u64  addr_b, [b_ptr];
+    ld.param.u64  addr_out, [out_ptr];
+    ld.param.u32  n_val, [n];
+    ld.param.u32  dim_val, [dim];
+
+    // Block ID = which pair
+    cvta.to.global.u64 addr_a, addr_a;
+    cvta.to.global.u64 addr_b, addr_b;
+    cvta.to.global.u64 addr_out, addr_out;
+
+    mov.u32  block_id, %ctaid.x;
+    mov.u32  tid, %tid.x;
+
+    // Skip if block_id >= n
+    setp.ge.u32  p_valid, block_id, n_val;
+    @p_valid bra  EXIT;
+
+    // Compute base addresses for this pair
+    // a_offset = block_id * dim * 4
+    mad.wide.u32  idx, block_id, dim_val, 0;
+    shl.b32       idx, idx, 2;           // * sizeof(float)
+    add.u64       addr_a, addr_a, idx;
+    add.u64       addr_b, addr_b, idx;
+
+    // Each thread sums over dim elements with stride = blockDim.x
+    mov.f64  dsum, 0.0;
+    mov.f64  dnorm_a, 0.0;
+    mov.f64  dnorm_b, 0.0;
+
+    mov.u32  stride, %ntid.x;           // blockDim.x
+    setp.ge.u32  p_valid, tid, dim_val;
+    @p_valid bra  REDUCE;
+
+LOOP:
+    // Load a[tid] and b[tid]
+    ld.global.f32  fval, [addr_a + tid*4];
+    ld.global.f32  ftmp, [addr_b + tid*4];
+
+    // dot += a[i] * b[i]
+    fma.rn.f64  dsum, fval, ftmp, dsum;
+
+    // norm_a += a[i]^2
+    fma.rn.f64  dnorm_a, fval, fval, dnorm_a;
+
+    // norm_b += b[i]^2
+    fma.rn.f64  dnorm_b, ftmp, ftmp, dnorm_b;
+
+    add.u32  tid, tid, stride;
+    setp.lt.u32  p_valid, tid, dim_val;
+    @p_valid bra  LOOP;
+
+REDUCE:
+    // Shuffle reduce within warp
+    mov.u32  lane_id, %laneid;
+
+    // Reduce dsum across warp using shfl
+    shfl.down.b32  ftmp, fval, 16, 0x1f;  // placeholder — real reduce below
+
+    // For simplicity, use shared memory reduction
+    .shared .f32  smem[256];  // max 256 threads
+
+    // Convert to f32 for shared mem
+    cvt.rn.f32.f64  fsum, dsum;
+    cvt.rn.f32.f64  fnorm_a, dnorm_a;
+    cvt.rn.f32.f64  fnorm_b, dnorm_b;
+
+    // Store partial sums
+    shl.b32  idx, tid, 2;
+    st.shared.f32  [idx], fsum;
+    st.shared.f32  [idx + 256], fnorm_a;
+    st.shared.f32  [idx + 512], fnorm_b;
+    bar.sync  0;
+
+    // Sequential reduction in thread 0
+    setp.ne.u32  p_valid, tid, 0;
+    @p_valid bra  STORE;
+
+    mov.f32  fsum, 0.0;
+    mov.f32  fnorm_a, 0.0;
+    mov.f32  fnorm_b, 0.0;
+    mov.u32  idx, 0;
+
+REDUCE_LOOP:
+    ld.shared.f32  fval, [idx*4];
+    add.f32        fsum, fsum, fval;
+    ld.shared.f32  fval, [idx*4 + 256*4];
+    add.f32        fnorm_a, fnorm_a, fval;
+    ld.shared.f32  fval, [idx*4 + 512*4];
+    add.f32        fnorm_b, fnorm_b, fval;
+    add.u32        idx, idx, 1;
+    setp.lt.u32    p_valid, idx, %ntid.x;
+    @p_valid bra  REDUCE_LOOP;
+
+    // cosine_sim = dot / (sqrt(norm_a) * sqrt(norm_b))
+    sqrt.rn.f32  fnorm_a, fnorm_a;
+    sqrt.rn.f32  fnorm_b, fnorm_b;
+    mul.f32      fnorm_a, fnorm_a, fnorm_b;
+    setp.eq.f32  p_valid, fnorm_a, 0.0;
+    @p_valid bra  ZERO;
+    div.rn.f32   fsum, fsum, fnorm_a;
+    bra  STORE;
+
+ZERO:
+    mov.f32  fsum, 0.0;
+
+STORE:
+    // Thread 0 writes result
+    st.global.f32  [addr_out + block_id*4], fsum;
+
+EXIT:
+    ret;
+}

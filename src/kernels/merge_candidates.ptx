@@ -1,0 +1,111 @@
+//
+// merge_candidates.ptx — Identify merge candidates above threshold
+// Grand Pattern Fibonacci Dual-Direction Architecture
+//
+// Each thread handles one pair (i, i+1) of consecutive embeddings.
+// If cosine similarity > threshold, mark as merge candidate.
+// Uses atomic counter to track total candidates.
+//
+
+.version 8.0
+.target sm_70
+.address_size 64
+
+.visible .entry merge_candidates(
+    .param .u64 embeddings_ptr,
+    .param .u64 strengths_ptr,
+    .param .u64 candidates_ptr,    // output: n-1 bools
+    .param .u64 candidate_count_ptr, // atomic counter
+    .param .u32 n,
+    .param .u32 dim,
+    .param .f32 threshold
+)
+{
+    .reg .f32   fv_a, fv_b, fdot, fnorm_a, fnorm_b, fsim, fthresh;
+    .reg .f64   ddot, dn_a, dn_b;
+    .reg .u64   addr_e, addr_s, addr_c, addr_count;
+    .reg .u32   tid, n_val, dim_val, one, idx;
+    .reg .pred  p_valid, p_merge;
+
+    ld.param.u64  addr_e, [embeddings_ptr];
+    ld.param.u64  addr_s, [strengths_ptr];
+    ld.param.u64  addr_c, [candidates_ptr];
+    ld.param.u64  addr_count, [candidate_count_ptr];
+    ld.param.u32  n_val, [n];
+    ld.param.u32  dim_val, [dim];
+    ld.param.f32  fthresh, [threshold];
+
+    cvta.to.global.u64 addr_e, addr_e;
+    cvta.to.global.u64 addr_s, addr_s;
+    cvta.to.global.u64 addr_c, addr_c;
+    cvta.to.global.u64 addr_count, addr_count;
+
+    mov.u32  tid, %tid.x;
+
+    // n-1 possible pairs
+    setp.ge.u32  p_valid, tid, n_val;
+    @p_valid bra  EXIT;
+    sub.u32  n_val, n_val, 1;
+    setp.ge.u32  p_valid, tid, n_val;
+    @p_valid bra  EXIT;
+
+    // Compute cosine similarity between embedding[tid] and embedding[tid+1]
+    .reg .u64  addr_a, addr_b;
+    mad.wide.u32  idx, tid, dim_val, 0;
+    shl.b32       idx, idx, 2;
+    add.u64       addr_a, addr_e, idx;
+
+    add.u32       idx, tid, 1;
+    mad.wide.u32  idx, idx, dim_val, 0;
+    shl.b32       idx, idx, 2;
+    add.u64       addr_b, addr_e, idx;
+
+    // Simple dot product (each thread does full dim — for small dims)
+    mov.f64  ddot, 0.0;
+    mov.f64  dn_a, 0.0;
+    mov.f64  dn_b, 0.0;
+    mov.u32  idx, 0;
+
+DOT_LOOP:
+    setp.ge.u32  p_valid, idx, dim_val;
+    @p_valid bra  COMPARE;
+
+    ld.global.f32  fv_a, [addr_a + idx*4];
+    ld.global.f32  fv_b, [addr_b + idx*4];
+
+    fma.rn.f64  ddot, fv_a, fv_b, ddot;
+    fma.rn.f64  dn_a, fv_a, fv_a, dn_a;
+    fma.rn.f64  dn_b, fv_b, fv_b, dn_b;
+
+    add.u32  idx, idx, 1;
+    bra  DOT_LOOP;
+
+COMPARE:
+    cvt.rn.f32.f64  fdot, ddot;
+    cvt.rn.f32.f64  fnorm_a, dn_a;
+    cvt.rn.f32.f64  fnorm_b, dn_b;
+
+    sqrt.rn.f32  fnorm_a, fnorm_a;
+    sqrt.rn.f32  fnorm_b, fnorm_b;
+    mul.f32      fnorm_a, fnorm_a, fnorm_b;
+    setp.eq.f32  p_valid, fnorm_a, 0.0;
+    @p_valid bra  NO_MERGE;
+
+    div.rn.f32   fsim, fdot, fnorm_a;
+    setp.ge.f32  p_merge, fsim, fthresh;
+    @p_merge bra  MERGE;
+    bra  NO_MERGE;
+
+MERGE:
+    mov.u32  one, 1;
+    st.global.u32  [addr_c + tid*4], one;
+    atom.global.add.u32  one, [addr_count], one;
+    bra  EXIT;
+
+NO_MERGE:
+    mov.u32  one, 0;
+    st.global.u32  [addr_c + tid*4], one;
+
+EXIT:
+    ret;
+}

@@ -1,0 +1,57 @@
+//
+// decay.ptx — Exponential decay kernel
+// Grand Pattern Fibonacci Dual-Direction Architecture
+//
+// strengths[i] *= exp(-rate * ages[i])
+// Each thread handles one element.
+//
+
+.version 8.0
+.target sm_70
+.address_size 64
+
+.extern .func (.f32 .result) __nv_expf(.param .f32 x);
+
+.visible .entry decay(
+    .param .u64 strengths_ptr,
+    .param .u64 ages_ptr,
+    .param .u32 n,
+    .param .f32 rate
+)
+{
+    .reg .f32   fstrength, fage, frate, fdecay;
+    .reg .u64   addr_s, addr_a;
+    .reg .u32   tid, n_val;
+    .reg .pred  p_valid;
+
+    ld.param.u64  addr_s, [strengths_ptr];
+    ld.param.u64  addr_a, [ages_ptr];
+    ld.param.u32  n_val, [n];
+    ld.param.f32  frate, [rate];
+
+    cvta.to.global.u64 addr_s, addr_s;
+    cvta.to.global.u64 addr_a, addr_a;
+
+    mov.u32  tid, %tid.x;
+
+    setp.ge.u32  p_valid, tid, n_val;
+    @p_valid bra  EXIT;
+
+    ld.global.f32  fstrength, [addr_s + tid*4];
+    ld.global.f32  fage,      [addr_a + tid*4];
+
+    // decay = exp(-rate * age)
+    mul.f32  fdecay, frate, fage;
+    neg.f32  fdecay, fdecay;
+    // Approximate exp using PTX ex2 approximation: exp(x) = exp2(x * log2(e))
+    // log2(e) ≈ 1.4427
+    mul.f32  fdecay, fdecay, 1.4427001953125;
+    ex2.approx.ftz.f32  fdecay, fdecay;
+
+    // strength *= decay
+    mul.f32  fstrength, fstrength, fdecay;
+    st.global.f32  [addr_s + tid*4], fstrength;
+
+EXIT:
+    ret;
+}

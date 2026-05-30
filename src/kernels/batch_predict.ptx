@@ -1,0 +1,73 @@
+//
+// batch_predict.ptx — Parallel JEPA prediction kernel
+// Grand Pattern Fibonacci Dual-Direction Architecture
+//
+// Each thread block handles one embedding prediction.
+// prediction[i] = perception[i] + delta * direction
+// where direction is a learned step toward the predicted embedding.
+//
+
+.version 8.0
+.target sm_70
+.address_size 64
+
+.visible .entry batch_predict(
+    .param .u64 perceptions_ptr,
+    .param .u64 predictions_ptr,
+    .param .u64 result_ptr,
+    .param .u32 n,
+    .param .u32 dim,
+    .param .f32 delta
+)
+{
+    .reg .f32   fval, fpred, fresult, fdelta;
+    .reg .u64   addr_p, addr_pr, addr_r;
+    .reg .u32   tid, block_id, stride, idx, dim_val, n_val;
+    .reg .pred  p_valid;
+
+    ld.param.u64  addr_p, [perceptions_ptr];
+    ld.param.u64  addr_pr, [predictions_ptr];
+    ld.param.u64  addr_r, [result_ptr];
+    ld.param.u32  n_val, [n];
+    ld.param.u32  dim_val, [dim];
+    ld.param.f32  fdelta, [delta];
+
+    cvta.to.global.u64 addr_p, addr_p;
+    cvta.to.global.u64 addr_pr, addr_pr;
+    cvta.to.global.u64 addr_r, addr_r;
+
+    mov.u32  block_id, %ctaid.x;
+    mov.u32  tid, %tid.x;
+
+    setp.ge.u32  p_valid, block_id, n_val;
+    @p_valid bra  EXIT;
+
+    // Base offset = block_id * dim
+    mad.wide.u32  idx, block_id, dim_val, 0;
+    shl.b32       idx, idx, 2;
+
+    add.u64  addr_p, addr_p, idx;
+    add.u64  addr_pr, addr_pr, idx;
+    add.u64  addr_r, addr_r, idx;
+
+    mov.u32  stride, %ntid.x;
+    setp.ge.u32  p_valid, tid, dim_val;
+    @p_valid bra  EXIT;
+
+LOOP:
+    ld.global.f32  fval,  [addr_p + tid*4];
+    ld.global.f32  fpred, [addr_pr + tid*4];
+
+    // result = perception + delta * (prediction - perception)
+    sub.f32  fresult, fpred, fval;
+    fma.rn.f32  fresult, fdelta, fresult, fval;
+
+    st.global.f32  [addr_r + tid*4], fresult;
+
+    add.u32  tid, tid, stride;
+    setp.lt.u32  p_valid, tid, dim_val;
+    @p_valid bra  LOOP;
+
+EXIT:
+    ret;
+}

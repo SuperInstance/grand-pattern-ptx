@@ -1,0 +1,116 @@
+//
+// vibe_compute.ptx — Vibe computation kernel
+// Grand Pattern Fibonacci Dual-Direction Architecture
+//
+// Computes vibe for each room from embeddings, positions, and velocities.
+// vibe[i] = normalize(embedding[i] + velocity[i] * dt)
+// Each thread block handles one room's vibe, threads iterate over dim.
+//
+
+.version 8.0
+.target sm_70
+.address_size 64
+
+.visible .entry vibe_compute(
+    .param .u64 embeddings_ptr,
+    .param .u64 velocities_ptr,
+    .param .u64 vibes_ptr,
+    .param .u32 n,
+    .param .u32 dim,
+    .param .f32 dt
+)
+{
+    .reg .f32   femb, fvel, fvibe, fdt, fnorm, fval;
+    .reg .f64   dnorm;
+    .reg .u64   addr_e, addr_v, addr_vb;
+    .reg .u32   tid, block_id, stride, idx, dim_val, n_val;
+    .reg .pred  p_valid;
+
+    .shared .f32  partial_norm[256];
+
+    ld.param.u64  addr_e, [embeddings_ptr];
+    ld.param.u64  addr_v, [velocities_ptr];
+    ld.param.u64  addr_vb, [vibes_ptr];
+    ld.param.u32  n_val, [n];
+    ld.param.u32  dim_val, [dim];
+    ld.param.f32  fdt, [dt];
+
+    cvta.to.global.u64 addr_e, addr_e;
+    cvta.to.global.u64 addr_v, addr_v;
+    cvta.to.global.u64 addr_vb, addr_vb;
+
+    mov.u32  block_id, %ctaid.x;
+    mov.u32  tid, %tid.x;
+
+    setp.ge.u32  p_valid, block_id, n_val;
+    @p_valid bra  EXIT;
+
+    // Base offset
+    mad.wide.u32  idx, block_id, dim_val, 0;
+    shl.b32       idx, idx, 2;
+    add.u64       addr_e, addr_e, idx;
+    add.u64       addr_v, addr_v, idx;
+    add.u64       addr_vb, addr_vb, idx;
+
+    // Compute vibe = embedding + velocity * dt, store partial norms
+    mov.f64  dnorm, 0.0;
+    mov.u32  stride, %ntid.x;
+    mov.u32  idx, tid;
+    setp.ge.u32  p_valid, idx, dim_val;
+    @p_valid bra  REDUCE;
+
+COMPUTE_LOOP:
+    ld.global.f32  femb, [addr_e + idx*4];
+    ld.global.f32  fvel, [addr_v + idx*4];
+
+    // vibe[i] = embedding[i] + velocity[i] * dt
+    fma.rn.f32  fvibe, fvel, fdt, femb;
+    st.global.f32  [addr_vb + idx*4], fvibe;
+
+    // Accumulate norm
+    fma.rn.f64  dnorm, fvibe, fvibe, dnorm;
+
+    add.u32  idx, idx, stride;
+    setp.lt.u32  p_valid, idx, dim_val;
+    @p_valid bra  COMPUTE_LOOP;
+
+REDUCE:
+    // Shared memory reduction of partial norms
+    cvt.rn.f32.f64  fnorm, dnorm;
+    st.shared.f32  [tid*4], fnorm;
+    bar.sync  0;
+
+    // Thread 0 sums all partial norms
+    setp.ne.u32  p_valid, tid, 0;
+    @p_valid bra  EXIT;
+
+    mov.f32  fnorm, 0.0;
+    mov.u32  idx, 0;
+
+NORM_LOOP:
+    ld.shared.f32  fval, [idx*4];
+    add.f32        fnorm, fnorm, fval;
+    add.u32        idx, idx, 1;
+    setp.lt.u32    p_valid, idx, %ntid.x;
+    @p_valid bra  NORM_LOOP;
+
+    sqrt.rn.f32  fnorm, fnorm;
+
+    // Now normalize: divide each vibe component by norm
+    // Re-iterate over dim (thread 0 does it all for simplicity)
+    mov.u32  idx, 0;
+
+NORMALIZE_LOOP:
+    setp.ge.u32  p_valid, idx, dim_val;
+    @p_valid bra  EXIT;
+
+    ld.global.f32  fvibe, [addr_vb + idx*4];
+    div.rn.f32     fvibe, fvibe, fnorm;
+    st.global.f32  [addr_vb + idx*4], fvibe;
+
+    add.u32  idx, idx, 1;
+    bra  NORMALIZE_LOOP;
+
+EXIT:
+    ret;
+}

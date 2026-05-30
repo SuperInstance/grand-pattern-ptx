@@ -1,0 +1,141 @@
+//
+// correlation_matrix.ptx — All-pairs cosine similarity matrix
+// Grand Pattern Fibonacci Dual-Direction Architecture
+//
+// Computes n_rooms x n_rooms correlation matrix of vibe vectors.
+// Each thread block (blockIdx.x, blockIdx.y) computes one pair (i, j).
+// Only computes upper triangle + diagonal; mirrors to lower triangle.
+//
+
+.version 8.0
+.target sm_70
+.address_size 64
+
+.visible .entry correlation_matrix(
+    .param .u64 vibes_ptr,
+    .param .u64 matrix_ptr,
+    .param .u32 n_rooms,
+    .param .u32 dim
+)
+{
+    .reg .f32   fv_a, fv_b, fdot, fnorm_a, fnorm_b, fsim;
+    .reg .f64   ddot, dn_a, dn_b;
+    .reg .u64   addr_v, addr_m;
+    .reg .u32   row, col, dim_val, n_val, tid, stride, idx;
+    .reg .pred  p_valid;
+
+    ld.param.u64  addr_v, [vibes_ptr];
+    ld.param.u64  addr_m, [matrix_ptr];
+    ld.param.u32  n_val, [n_rooms];
+    ld.param.u32  dim_val, [dim];
+
+    cvta.to.global.u64 addr_v, addr_v;
+    cvta.to.global.u64 addr_m, addr_m;
+
+    mov.u32  row, %ctaid.x;
+    mov.u32  col, %ctaid.y;
+    mov.u32  tid, %tid.x;
+
+    // Only compute upper triangle (row <= col)
+    setp.gt.u32  p_valid, row, col;
+    @p_valid bra  EXIT;
+
+    setp.ge.u32  p_valid, row, n_val;
+    @p_valid bra  EXIT;
+    setp.ge.u32  p_valid, col, n_val;
+    @p_valid bra  EXIT;
+
+    // Base offsets for vibes[row] and vibes[col]
+    .reg .u64  addr_a, addr_b;
+    mad.wide.u32  idx, row, dim_val, 0;
+    shl.b32       idx, idx, 2;
+    add.u64       addr_a, addr_v, idx;
+
+    mad.wide.u32  idx, col, dim_val, 0;
+    shl.b32       idx, idx, 2;
+    add.u64       addr_b, addr_v, idx;
+
+    // Compute dot product and norms
+    mov.f64  ddot, 0.0;
+    mov.f64  dn_a, 0.0;
+    mov.f64  dn_b, 0.0;
+    mov.u32  stride, %ntid.x;
+    mov.u32  idx, tid;
+
+    setp.ge.u32  p_valid, idx, dim_val;
+    @p_valid bra  REDUCE;
+
+DOT_LOOP:
+    ld.global.f32  fv_a, [addr_a + idx*4];
+    ld.global.f32  fv_b, [addr_b + idx*4];
+
+    fma.rn.f64  ddot, fv_a, fv_b, ddot;
+    fma.rn.f64  dn_a, fv_a, fv_a, dn_a;
+    fma.rn.f64  dn_b, fv_b, fv_b, dn_b;
+
+    add.u32  idx, idx, stride;
+    setp.lt.u32  p_valid, idx, dim_val;
+    @p_valid bra  DOT_LOOP;
+
+REDUCE:
+    // Use shared memory for reduction
+    .shared .f32  smem_dot[256];
+    .shared .f32  smem_na[256];
+    .shared .f32  smem_nb[256];
+
+    cvt.rn.f32.f64  fdot, ddot;
+    cvt.rn.f32.f64  fnorm_a, dn_a;
+    cvt.rn.f32.f64  fnorm_b, dn_b;
+
+    st.shared.f32  [tid*4], fdot;
+    st.shared.f32  [tid*4 + 1024], fnorm_a;
+    st.shared.f32  [tid*4 + 2048], fnorm_b;
+    bar.sync  0;
+
+    setp.ne.u32  p_valid, tid, 0;
+    @p_valid bra  EXIT;
+
+    // Sequential reduction
+    mov.f32  fdot, 0.0;
+    mov.f32  fnorm_a, 0.0;
+    mov.f32  fnorm_b, 0.0;
+    mov.u32  idx, 0;
+
+RLOOP:
+    ld.shared.f32  fv_a, [idx*4];
+    add.f32        fdot, fdot, fv_a;
+    ld.shared.f32  fv_a, [idx*4 + 1024];
+    add.f32        fnorm_a, fnorm_a, fv_a;
+    ld.shared.f32  fv_a, [idx*4 + 2048];
+    add.f32        fnorm_b, fnorm_b, fv_a;
+    add.u32        idx, idx, 1;
+    setp.lt.u32    p_valid, idx, %ntid.x;
+    @p_valid bra  RLOOP;
+
+    // cosine_sim = dot / (sqrt(norm_a) * sqrt(norm_b))
+    sqrt.rn.f32  fnorm_a, fnorm_a;
+    sqrt.rn.f32  fnorm_b, fnorm_b;
+    mul.f32      fnorm_a, fnorm_a, fnorm_b;
+    setp.eq.f32  p_valid, fnorm_a, 0.0;
+    @p_valid bra  ZERO;
+
+    div.rn.f32   fsim, fdot, fnorm_a;
+    bra  STORE;
+
+ZERO:
+    mov.f32  fsim, 0.0;
+
+STORE:
+    // matrix[row * n_rooms + col] = sim
+    mad.wide.u32  idx, row, n_val, col;
+    shl.b32       idx, idx, 2;
+    st.global.f32  [addr_m + idx], fsim;
+
+    // Mirror: matrix[col * n_rooms + row] = sim
+    mad.wide.u32  idx, col, n_val, row;
+    shl.b32       idx, idx, 2;
+    st.global.f32  [addr_m + idx], fsim;
+
+EXIT:
+    ret;
+}
